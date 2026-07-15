@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+message: "If you use this software in your research, please cite it as below."
+title: "DirectSD-Python: A Python Toolbox for Sampled-Data Control Systems"
+version: 3.0.0
+date-released: 2026-07-15
+url: "https://github.com/RooDK0x7b4/DirectSD-Python"
+repository-code: "https://github.com/RooDK0x7b4/DirectSD-Python"
+license: BSD-3-Clause
+type: software
+authors:
+  - given-names: "Roozbeh"
+    family-names: "Dargahi"
+keywords:
+  - sampled-data control
+  - H2 control
+  - H-infinity control
+  - polynomial methods
+  - Diophantine equations
+  - digital control
+  - Python

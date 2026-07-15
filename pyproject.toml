@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "directsd"
+version = "3.0.0"
+description = "Direct Sampled-Data Control Systems Toolbox — Python port of MATLAB DirectSD v3.0"
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [
+    { name = "Roozbeh Dargahi", email = "roozbehdargahi.0x7b4@gmail.com" },
+]
+license = { text = "BSD-3-Clause" }
+keywords = [
+    "control-systems", "sampled-data", "h2-control", "h-infinity",
+    "diophantine-equations", "polynomial-methods", "digital-control",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: BSD License",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "numpy>=1.21",
+    "scipy>=1.7",
+]
+
+[project.urls]
+Homepage = "https://github.com/RooDK0x7b4/DirectSD-Python"
+Repository = "https://github.com/RooDK0x7b4/DirectSD-Python"
+Issues = "https://github.com/RooDK0x7b4/DirectSD-Python/issues"
+
+[project.optional-dependencies]
+control = ["control>=0.9"]
+plot    = ["matplotlib>=3.4"]
+convex  = ["cvxpy>=1.3"]
+dev     = ["pytest>=7.0", "matplotlib>=3.4"]
+all     = ["control>=0.9", "matplotlib>=3.4", "cvxpy>=1.3"]
+
+[tool.setuptools.packages.find]
+where   = ["."]
+include = ["directsd*"]
+exclude = ["directsd.tests*"]
+
+[tool.pytest.ini_options]
+testpaths = ["directsd/tests"]
+filterwarnings = [
+    "ignore:Badly conditioned filter coefficients:UserWarning",
+]

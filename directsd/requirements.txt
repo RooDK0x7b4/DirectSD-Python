@@ -1,0 +1,12 @@
+# DirectSD Python Package – Runtime dependencies
+numpy>=1.21
+scipy>=1.7
+
+# Optional: for control-systems interoperability (duck-typed inputs)
+# control>=0.9
+
+# Optional: for visualization in examples
+# matplotlib>=3.4
+
+# Development / testing
+# pytest>=7.0
