@@ -1,5 +1,9 @@
 # DirectSD — Python Package
 
+[![PyPI version](https://img.shields.io/pypi/v/DirectSD-Python.svg)](https://pypi.org/project/DirectSD-Python/)
+[![Python versions](https://img.shields.io/pypi/pyversions/DirectSD-Python.svg)](https://pypi.org/project/DirectSD-Python/)
+[![License](https://img.shields.io/badge/license-BSD--3--Clause-blue.svg)](LICENSE)
+
 [github.com/RooDK0x7b4/DirectSD-Python](https://github.com/RooDK0x7b4/DirectSD-Python)
 
 Python port of the **DirectSD MATLAB Toolbox v3.0** by Konstantin Polyakov (1995–2006).
