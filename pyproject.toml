@@ -3,7 +3,7 @@ requires = ["setuptools>=42", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "directsd"
+name = "DirectSD-Python"
 version = "0.1.0"
 description = "Direct Sampled-Data Control Systems Toolbox — Python port of MATLAB DirectSD v3.0"
 readme = "README.md"
