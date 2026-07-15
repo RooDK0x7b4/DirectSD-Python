@@ -1,7 +1,7 @@
 cff-version: 1.2.0
 message: "If you use this software in your research, please cite it as below."
 title: "DirectSD-Python: A Python Toolbox for Sampled-Data Control Systems"
-version: 3.0.0
+version: 0.1.0
 date-released: 2026-07-15
 url: "https://github.com/RooDK0x7b4/DirectSD-Python"
 repository-code: "https://github.com/RooDK0x7b4/DirectSD-Python"

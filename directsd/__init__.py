@@ -11,7 +11,7 @@ Modules:
     glopt       - Global optimization routines
 """
 
-__version__ = "3.0.0"
+__version__ = "0.1.0"
 __author__ = "Python port. Original MATLAB toolbox by Konstantin Polyakov (1995-2006)."
 
 # Generalized plant
