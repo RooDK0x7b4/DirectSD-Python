@@ -27,7 +27,7 @@ from __future__ import annotations
 import numpy as np
 import scipy.linalg as la
 
-__all__ = ['dare1']
+__all__ = ['dare1', 'care2']
 
 _SQRT_EPS = np.sqrt(np.finfo(float).eps)
 
@@ -195,3 +195,67 @@ def dare1(A, B, Q, R, S=None, E=None, uc_tol=None):
         err = float(np.linalg.norm(res) / max(1.0, np.linalg.norm(X)))
 
     return X, poles, err
+
+
+def care2(A, Q, R):
+    """
+    Solve the continuous algebraic Riccati equation ``A'P + PA - PRP + Q = 0``
+    via the Hamiltonian-matrix eigenstructure method, also returning the
+    stable-eigenspace factors P1/P2 (P = P2 @ inv(P1)).
+
+    Port of ``dsdsspace/private/care2.m`` (K. Polyakov) — used by ``hinfone``
+    (Safonov-Limebeer-Chiang gamma=1 Hinf synthesis), which needs the raw
+    P1/P2 factors directly for its descriptor-form controller assembly, not
+    just P itself (unlike ``scipy.linalg.solve_continuous_are``).
+
+    MATLAB's ``care2.m`` gets P1/P2 from a custom ``reig`` (real ordered
+    eigendecomposition, stable eigenvalues first) that isn't in this
+    codebase's source tree. ``scipy.linalg.schur(H, output='real',
+    sort='lhp')`` is the direct, standard equivalent: it returns a real
+    quasi-upper-triangular Schur form with the stable (left-half-plane)
+    eigenvalues collected in the leading block, and Z's leading columns are
+    exactly the real Schur vectors ``reig`` would have produced.
+
+    Parameters
+    ----------
+    A, Q, R : (n, n) ndarray
+
+    Returns
+    -------
+    P : (n, n) ndarray
+        Symmetrized solution.
+    poles : (n,) ndarray
+        Closed-loop poles (the n stable eigenvalues of the Hamiltonian).
+    err : float
+        Residual norm ``||P@A + A'@P - P@R@P + Q||``.
+    P1, P2 : (n, n) ndarray
+        Stable-eigenspace factors such that P = P2 @ inv(P1).
+    """
+    A = np.atleast_2d(np.asarray(A, float))
+    Q = np.atleast_2d(np.asarray(Q, float))
+    R = np.atleast_2d(np.asarray(R, float))
+    n = A.shape[0]
+
+    # Special case: A already stable and Q=0 -> P=0 (care2.m's fast path).
+    if np.all(np.linalg.eigvals(A).real <= 0) and np.linalg.norm(Q) == 0:
+        P1 = np.eye(n)
+        P2 = np.zeros((n, n))
+        P = np.zeros((n, n))
+        poles = np.linalg.eigvals(A)
+        return P, poles, 0.0, P1, P2
+
+    H = np.block([[A, -R], [-Q, -A.T]])
+    T, Z, sdim = la.schur(H, output='real', sort='lhp')
+    if sdim != n:
+        raise np.linalg.LinAlgError(
+            f"care2: Hamiltonian has {sdim} stable eigenvalues, expected {n} "
+            f"(the Riccati problem may not have a well-posed solution)")
+
+    P1 = Z[:n, :n]
+    P2 = Z[n:, :n]
+    P = np.real(P2 @ np.linalg.inv(P1))
+    poles = np.linalg.eigvals(T[:n, :n])
+
+    err = float(np.linalg.norm(P @ A + A.T @ P - P @ R @ P + Q))
+
+    return P, poles, err, P1, P2

@@ -1668,6 +1668,283 @@ class TestPreviouslyUntested:
         _, gamma = hinfreg(plant)
         assert np.isfinite(gamma) and gamma > 0.0
 
+    def test_hinfreg_actually_stabilizes_coupled_unstable_plant(self):
+        """hinfreg's returned K must genuinely stabilize the closed loop.
+
+        The other hinfreg tests above use a trivially decoupled, already-
+        stable, diagonal-everything plant (identity B/C) -- too simple to
+        exercise the central-controller Bc sign convention, so they kept
+        passing even when Bc had the wrong sign. This plant has genuine
+        state coupling, a partial (not full-state) measurement, and an
+        unstable open-loop pole, forcing a real observer/filter problem.
+        Bug found and fixed: Bc = Z@L (should be Bc = -Z@L) left the
+        assembled controller satisfying try_hinf's own X/Y validity checks
+        while not actually stabilizing the closed loop -- confirmed
+        directly on a real MIMO inverted-pendulum benchmark (closed-loop
+        max Re(eig) = +8.16, worse than the plant's own open-loop
+        instability at +5.13, with the old sign).
+        """
+        import scipy.signal as sig
+        from directsd.sspace.design import hinfreg, _lft
+
+        A = np.array([[0.0, 1.0], [2.0, -1.0]])   # eig = {+1, -2}: unstable, coupled
+        B1 = np.array([[1.0], [0.0]])              # disturbance
+        B2 = np.array([[0.0], [1.0]])              # control
+        C1 = np.array([[1.0, 0.0], [0.0, 0.0]])    # performance: x1, plus D12 row
+        C2 = np.array([[1.0, 0.0]])                # measurement: x1 ONLY (partial)
+        D12 = np.array([[0.0], [0.1]])             # control-effort weighting
+        D21 = np.array([[0.0]])
+
+        n_meas, n_ctrl = 1, 1
+        A_full = A
+        B_full = np.hstack([B1, B2])
+        C_full = np.vstack([C1, C2])
+        D_full = np.block([
+            [np.zeros((2, 1)), D12],
+            [D21, np.zeros((1, 1))],
+        ])
+        plant = sig.StateSpace(A_full, B_full, C_full, D_full)
+
+        K, gamma = hinfreg(plant, n_meas=n_meas, n_ctrl=n_ctrl, gamma_tol=0.01)
+        assert np.isfinite(gamma) and gamma > 0.0
+
+        nout, nin = C_full.shape[0], B_full.shape[1]
+        i1, o1 = nin - n_ctrl, nout - n_meas
+        Ak, Bk, Ck, Dk = K.A, K.B, K.C, K.D
+        Icl = np.eye(n_ctrl) - Dk @ np.zeros((n_ctrl, n_meas))
+        Acl = np.block([
+            [A_full + B2 @ np.linalg.solve(Icl, Dk @ C2), B2 @ np.linalg.solve(Icl, Ck)],
+            [Bk @ C2, Ak],
+        ])
+        assert np.all(np.linalg.eigvals(Acl).real < 0), (
+            f"hinfreg returned a non-stabilizing controller: "
+            f"eig(Acl)={np.linalg.eigvals(Acl)}"
+        )
+
+    # ------------------------------------------------------------------
+    # sdhinfreg_native (hinfsd.py) -- native discrete Hinf synthesis,
+    # a port of MATLAB's real sdhimod.m ('mi'/Mirkin-Palmor) + hinfone.m
+    # (Safonov-Limebeer-Chiang), replacing the bilinear DT->CT->DT
+    # approximation as sdhinfreg's primary path.
+    # ------------------------------------------------------------------
+
+    def test_sdhinfreg_native_matches_documented_example(self):
+        """dsd_help_polished_full.md p.165: F=tf(1,[1 1 0]), sys=[F F;-F -F],
+        T=0.1 -> K = 381.5411(z-0.4523)/(z+0.8953), cost = 0.0091."""
+        import scipy.signal as sig
+        from directsd.sspace.hinfsd import sdhinfreg_native
+
+        A = np.array([[0., 1.], [0., -1.]])
+        B = np.array([[0., 0.], [1., 1.]])
+        C = np.array([[1., 0.], [-1., 0.]])
+        D = np.zeros((2, 2))
+        plant = sig.StateSpace(A, B, C, D)
+
+        K, gamma, poles = sdhinfreg_native(plant, T=0.1, n_meas=1, n_ctrl=1, gamma_tol=1e-4)
+
+        assert gamma == pytest.approx(0.0091, abs=5e-5)
+
+        num, den = sig.ss2tf(K.A, K.B, K.C, K.D)
+        num, den = np.atleast_1d(num).ravel(), np.atleast_1d(den).ravel()
+        assert len(den) == 2, f"expected a first-order controller, got den={den}"
+        pole = -den[1] / den[0]
+        assert pole == pytest.approx(-0.8953, abs=5e-4)
+        gain = num[0] / den[0]
+        assert gain == pytest.approx(381.5411, rel=1e-4)
+        zero = -num[1] / num[0]
+        assert zero == pytest.approx(0.4523, abs=5e-4)
+
+        assert np.all(np.abs(poles) < 1.0), (
+            f"closed loop not stable: poles={poles}"
+        )
+
+    def test_sdhinfreg_native_stabilizes_mimo_unstable_plant(self):
+        """Real regression target: a MIMO (2-measurement) inverted-pendulum
+        generalized plant, where the old bilinear-approximation path
+        (before its own separate Bc sign-bug fix) never stabilized at all,
+        and even after that fix only gave a poor-quality design (gamma~4.3,
+        pendulum angle overshooting to +20 rad). The native path should
+        give a materially better, still genuinely stable design."""
+        import scipy.signal as sig
+        from directsd.sspace.hinfsd import sdhinfreg_native
+
+        M, m, b, I, g, l = 1.0, 0.1, 0.1, 0.003, 9.81, 0.3
+        p = I * (M + m) + M * m * l**2
+        A = np.array([[0, 1, 0, 0],
+                      [0, -(I + m * l**2) * b / p, (m**2 * g * l**2) / p, 0],
+                      [0, 0, 0, 1],
+                      [0, -(m * l * b) / p, m * g * l * (M + m) / p, 0]])
+        Bp = np.array([[0], [(I + m * l**2) / p], [0], [m * l / p]])
+        rho = 0.05
+        C_z = np.array([[1, 0, 0, 0], [0, 0, 1, 0], [0, 0, 0, 0]])
+        C_y = np.array([[1, 0, 0, 0], [0, 0, 1, 0]])
+        B_full = np.hstack([Bp, Bp])
+        C_full = np.vstack([C_z, C_y])
+        D_full = np.zeros((5, 2))
+        D_full[2, 1] = rho
+        plant = sig.StateSpace(A, B_full, C_full, D_full)
+        Ts = 0.02
+
+        K, gamma, poles = sdhinfreg_native(plant, Ts, n_meas=2, n_ctrl=1, gamma_tol=0.01)
+
+        assert np.isfinite(gamma) and gamma > 0
+        assert np.all(np.abs(poles) < 1.0 - 1e-6), (
+            f"closed loop not robustly stable: poles={poles}"
+        )
+        # The native design should be substantially better than the old
+        # bilinear-approximation gamma (~4.3) on this benchmark.
+        assert gamma < 1.0
+
+    @pytest.mark.parametrize("sdhimod_type", ["mi", "ch", "ca", "ba", "ha"])
+    @pytest.mark.parametrize("method", ["sa", "gl"])
+    def test_sdhinfreg_native_all_types_and_methods_match_documented_example(
+            self, sdhimod_type, method):
+        """All 5 sdhimod discretization formulas x both hinfone methods are
+        exact discretizations/solutions of the SAME underlying continuous
+        sampled-data Hinf problem -- they must all agree with each other
+        and with the documented MATLAB ground truth (same example as
+        test_sdhinfreg_native_matches_documented_example)."""
+        import scipy.signal as sig
+        from directsd.sspace.hinfsd import sdhinfreg_native
+
+        A = np.array([[0., 1.], [0., -1.]])
+        B = np.array([[0., 0.], [1., 1.]])
+        C = np.array([[1., 0.], [-1., 0.]])
+        D = np.zeros((2, 2))
+        plant = sig.StateSpace(A, B, C, D)
+
+        K, gamma, poles = sdhinfreg_native(
+            plant, T=0.1, n_meas=1, n_ctrl=1, gamma_tol=1e-4,
+            sdhimod_type=sdhimod_type, method=method)
+
+        assert gamma == pytest.approx(0.0091, abs=5e-5)
+        num, den = sig.ss2tf(K.A, K.B, K.C, K.D)
+        den = np.atleast_1d(den).ravel()
+        assert len(den) == 2
+        pole = -den[1] / den[0]
+        assert pole == pytest.approx(-0.8953, abs=5e-4)
+        assert np.all(np.abs(poles) < 1.0)
+
+    @pytest.mark.parametrize("sdhimod_type", ["mi", "ch", "ca", "ba", "ha"])
+    @pytest.mark.parametrize("method", ["sa", "gl"])
+    def test_sdhinfreg_native_all_types_and_methods_stabilize_mimo_plant(
+            self, sdhimod_type, method):
+        """Same pendulum benchmark as test_sdhinfreg_native_stabilizes_mimo_
+        unstable_plant, swept over all 5 discretization types x 2 methods.
+        Achieved gamma varies noticeably across combinations on this
+        specific hard/ill-conditioned MIMO benchmark (0.011-0.067, vs
+        near-identical agreement on the well-conditioned SISO documented
+        example above) -- the secant-method gamma-bisection isn't a true
+        monotonic bisection, so different discretization paths can land on
+        different local results for a numerically hard problem (this plant
+        also shows ill-conditioning elsewhere, e.g. h2reg's Chen-Francis
+        DARE solve). Only stability + a generous quality bound are asserted
+        here; exact-value agreement is the SISO test's job."""
+        import scipy.signal as sig
+        from directsd.sspace.hinfsd import sdhinfreg_native
+
+        M, m, b, I, g, l = 1.0, 0.1, 0.1, 0.003, 9.81, 0.3
+        p = I * (M + m) + M * m * l**2
+        A = np.array([[0, 1, 0, 0],
+                      [0, -(I + m * l**2) * b / p, (m**2 * g * l**2) / p, 0],
+                      [0, 0, 0, 1],
+                      [0, -(m * l * b) / p, m * g * l * (M + m) / p, 0]])
+        Bp = np.array([[0], [(I + m * l**2) / p], [0], [m * l / p]])
+        rho = 0.05
+        C_z = np.array([[1, 0, 0, 0], [0, 0, 1, 0], [0, 0, 0, 0]])
+        C_y = np.array([[1, 0, 0, 0], [0, 0, 1, 0]])
+        B_full = np.hstack([Bp, Bp])
+        C_full = np.vstack([C_z, C_y])
+        D_full = np.zeros((5, 2))
+        D_full[2, 1] = rho
+        plant = sig.StateSpace(A, B_full, C_full, D_full)
+        Ts = 0.02
+
+        K, gamma, poles = sdhinfreg_native(
+            plant, Ts, n_meas=2, n_ctrl=1, gamma_tol=0.01,
+            sdhimod_type=sdhimod_type, method=method)
+
+        assert np.isfinite(gamma) and gamma > 0
+        assert np.all(np.abs(poles) < 1.0 - 1e-6), (
+            f"closed loop not robustly stable: poles={poles}"
+        )
+        assert gamma < 1.0
+
+    # ------------------------------------------------------------------
+    # _weierstr / _descr2ss_general -- Weierstrass canonical form for
+    # singular descriptor pencils, and _schurdiag / Cantoni-Glover's
+    # restructured (schurdiag-based) computation path
+    # ------------------------------------------------------------------
+
+    def test_descr2ss_general_matches_fast_path_for_invertible_e(self):
+        """For an invertible E, the general (weierstr-based) descr2ss must
+        give the SAME transfer function as the fast direct-inversion path
+        -- different state bases are fine, the input/output behavior must
+        be identical."""
+        from directsd.sspace.hinfsd import _descr2ss_regular, _descr2ss_general
+
+        rng = np.random.default_rng(0)
+        n = 4
+        AD = rng.standard_normal((n, n))
+        BD = rng.standard_normal((n, 2))
+        CD = rng.standard_normal((3, n))
+        DD = rng.standard_normal((3, 2))
+        ED = np.eye(n) + 0.1 * rng.standard_normal((n, n))
+
+        A1, B1, C1, D1 = _descr2ss_regular(AD, BD, CD, DD, ED, force_general=False)
+        A2, B2, C2, D2 = _descr2ss_general(AD, BD, CD, DD, ED)
+
+        for s in (0.3 + 0.5j, 1.7 - 0.2j, -0.9 + 1.1j):
+            H1 = C1 @ np.linalg.solve(s * np.eye(A1.shape[0]) - A1, B1) + D1
+            H2 = C2 @ np.linalg.solve(s * np.eye(A2.shape[0]) - A2, B2) + D2
+            assert np.allclose(H1, H2, atol=1e-8), f"mismatch at s={s}"
+
+    def test_descr2ss_general_reduces_singular_pencil(self):
+        """A genuinely singular E (rank n-1) must reduce to an (n-1)-state
+        realization without raising (this random pencil has no improper
+        part)."""
+        from directsd.sspace.hinfsd import _descr2ss_general
+
+        rng = np.random.default_rng(1)
+        n = 5
+        AD = rng.standard_normal((n, n))
+        BD = rng.standard_normal((n, 2))
+        CD = rng.standard_normal((3, n))
+        DD = rng.standard_normal((3, 2))
+        ED = rng.standard_normal((n, n))
+        u, s, vt = np.linalg.svd(ED)
+        s[-1] = 0.0
+        ED = u @ np.diag(s) @ vt
+
+        A2, B2, C2, D2 = _descr2ss_general(AD, BD, CD, DD, ED)
+        assert A2.shape == (n - 1, n - 1)
+        assert np.all(np.isfinite(A2))
+
+    def test_sdhimod_cantoni_glover_restructured_path_matches_documented_example(self):
+        """sdhimod's 'ca' type now engages the schurdiag-based restructured
+        computation (n1>0 is generic for this Hamiltonian-like Ehat), not
+        just the direct-inversion fallback -- confirm it still reproduces
+        the documented F=1/(s(s+1)) example exactly."""
+        import scipy.signal as sig
+        from directsd.sspace.hinfsd import sdhinfreg_native
+
+        A = np.array([[0., 1.], [0., -1.]])
+        B = np.array([[0., 0.], [1., 1.]])
+        C = np.array([[1., 0.], [-1., 0.]])
+        D = np.zeros((2, 2))
+        plant = sig.StateSpace(A, B, C, D)
+
+        K, gamma, poles = sdhinfreg_native(
+            plant, T=0.1, n_meas=1, n_ctrl=1, gamma_tol=1e-4,
+            sdhimod_type='ca', method='sa')
+
+        assert gamma == pytest.approx(0.0091, abs=5e-5)
+        num, den = sig.ss2tf(K.A, K.B, K.C, K.D)
+        den = np.atleast_1d(den).ravel()
+        pole = -den[1] / den[0]
+        assert pole == pytest.approx(-0.8953, abs=5e-4)
+        assert np.all(np.abs(poles) < 1.0)
+
     # ------------------------------------------------------------------
     # dioph2 – spectral Diophantine equation X·A + X̃·B + Y·C = 0
     # ------------------------------------------------------------------

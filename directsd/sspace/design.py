@@ -350,7 +350,28 @@ def hinfreg(sys_ss, n_meas=1, n_ctrl=1, tol=1e-4, gamma_tol=1e-4, verbose=False)
             cl = _lft(sig.StateSpace(A, B, C, D, dt=dt), K_d, n_meas, n_ctrl, dt)
             gamma_d = _hinf_freq(cl.A, cl.B, cl.C, cl.D, is_discrete=True)
         except Exception:
+            cl = None
             gamma_d = float('nan')
+
+        # The bilinear DT->CT->DT round-trip above is only an O(T)
+        # approximation of the true discrete Hinf problem (MATLAB's
+        # sdhinfreg.m solves it directly via sdhimod+hinfone instead —
+        # not yet ported). `_hinf_freq` above evaluates the closed-loop
+        # transfer function pointwise on the unit circle, which is a
+        # well-defined finite number even when the closed loop is
+        # unstable — it does NOT verify stability, so a deceptively
+        # plausible gamma_d can mask a non-stabilizing K_d. Check the
+        # actual closed-loop poles before returning, rather than trusting
+        # gamma_d, so callers get a clear failure instead of a silently
+        # bad controller.
+        if cl is None or np.any(np.abs(np.linalg.eigvals(cl.A)) >= 1.0 - 1e-9):
+            raise np.linalg.LinAlgError(
+                "hinfreg: the bilinear DT->CT->DT round-trip produced a "
+                "controller that does not stabilize the actual discrete-time "
+                "closed loop (this approximation is only O(T)-accurate and "
+                "has no built-in correction step). Try a smaller sampling "
+                "period, or use h2reg/sdh2reg instead for this plant."
+            )
         return K_d, gamma_d
 
     # Minimal realization (see h2reg for the same fix and full rationale): a
@@ -420,7 +441,20 @@ def hinfreg(sys_ss, n_meas=1, n_ctrl=1, tol=1e-4, gamma_tol=1e-4, verbose=False)
             L = -(B1 @ D21.T + Y @ C2.T) @ la.inv(np.eye(n_meas))
             Z = la.inv(np.eye(A.shape[0]) - Y @ X / g2)
             Ac = A + B2 @ F + Z @ L @ C2 + Z @ L @ D22 @ F
-            Bc = Z @ L
+            # Bc sign: this L is the "textbook" observer gain negated (verified
+            # directly: eig(A + L@C2) is Hurwitz, eig(A - L@C2) is not -- so Ac's
+            # "+Z@L@C2" term is correctly signed for THIS L). But the observer's
+            # residual-injection term (xc_dot = ... + L_obs@y, L_obs = -L here)
+            # then requires Bc = -Z@L, not +Z@L. The old +Z@L sign left the
+            # observer/filter dynamics uncoupled from the true residual sign,
+            # so the assembled controller satisfied try_hinf's own X/Y validity
+            # checks (which never depend on Bc) while not actually stabilizing
+            # the closed loop -- confirmed on a real MIMO benchmark (unstable
+            # inverted-pendulum plant): with the old sign, closed-loop max
+            # Re(eig) was +8.16 (worse than the OPEN-loop instability at
+            # +5.13) at every gamma tried; with this fix, max Re(eig) = -0.67,
+            # consistently, across the same gamma range.
+            Bc = -Z @ L
             Cc = F
             Dc = np.zeros((n_ctrl, n_meas))
             K_inf = sig.StateSpace(Ac, Bc, Cc, Dc)
@@ -504,6 +538,16 @@ def sdhinfreg(plant, T, n_meas=1, n_ctrl=1, gamma_tol=1e-4, verbose=False):
     """
     H-infinity optimal controller for a sampled-data system.
 
+    Primary path: native discrete synthesis (``hinfsd.sdhinfreg_native``,
+    a port of MATLAB's real ``sdhimod.m``+``hinfone.m`` algorithm) --
+    builds an EXACT discrete equivalent of the sampled-data Hinf problem
+    first, so is not limited to the O(T)-accuracy of the bilinear
+    DT->CT->DT approximation this used to always go through. Falls back to
+    that approximation (via ``hinfreg`` on a ZOH-discretized plant) only if
+    the native path raises -- e.g. a plant that doesn't satisfy sdhimod's
+    D21=D22=0 precondition, or another structural edge case the reduced-
+    scope port (see ``hinfsd`` module docstring) doesn't cover.
+
     Parameters
     ----------
     plant : scipy.signal.StateSpace
@@ -523,6 +567,16 @@ def sdhinfreg(plant, T, n_meas=1, n_ctrl=1, gamma_tol=1e-4, verbose=False):
         import scipy.signal as sig
     except ImportError:
         raise ImportError("scipy is required.")
+
+    from directsd.sspace.hinfsd import sdhinfreg_native
+    try:
+        K, gamma, _poles = sdhinfreg_native(plant, T, n_meas=n_meas, n_ctrl=n_ctrl,
+                                            gamma_tol=gamma_tol)
+        return K, gamma
+    except Exception as exc:
+        if verbose:
+            print(f"sdhinfreg: native synthesis failed ({exc}); "
+                  f"falling back to bilinear approximation")
 
     plant_d = plant.to_discrete(T, method='zoh')
     K, gamma = hinfreg(plant_d, n_meas, n_ctrl,

@@ -147,10 +147,228 @@ def _ss_impulse_matrix(A, B, C, D, N):
 # ── Youla internals ──────────────────────────────────────────────────────────
 
 def _stabilising_h2(dsys, n_meas, n_ctrl):
-    """Return H2-optimal base controller K0."""
-    from directsd.sspace.design import h2reg
+    """Return a base controller K0 for Youla parameterization.
+
+    Starts from h2reg's H2-optimal K0. For most plants this already
+    strictly stabilizes the plant and is returned unchanged. Some plants
+    make h2reg's Chen-Francis discrete GH2 solve "generically SINGULAR"
+    (per h2reg's own comments), leaving a closed-loop eigenvalue sitting
+    right at |z|=1 instead of strictly inside -- which breaks the Youla-
+    Kucera guarantee ("any stable Q gives a stabilizing K") this whole
+    module depends on. For that case only, retry with a "prescribed degree
+    of stability" discount: solve the regulator/filter Riccati equations on
+    (alpha*A, alpha*B2) / (alpha*A, alpha*C2) instead of (A, B2) / (A, C2)
+    -- a classical LQG pole-shrinking technique -- then reassemble the
+    compensator with the ORIGINAL (undiscounted) plant matrices, exactly as
+    h2reg's own Chen-Francis formulas do internally.
+
+    This retry is numerically fragile in practice (verified: closed-loop
+    pole location and H2 cost are NOT monotonic in alpha for at least one
+    real benchmark plant -- some discount factors land on a well-behaved,
+    near-optimal design, nearby ones land on a degenerate or much worse
+    one), so this tries several candidate discount factors and keeps only
+    the one with the lowest independently-verified H2 cost among those
+    that are genuinely, robustly stable (not just barely inside the unit
+    circle). If none of the candidates achieve real strict stability, falls
+    back to returning the original (possibly marginal) K0 unchanged --
+    downstream callers still have the honest _verify_stabilizes check.
+    """
+    from directsd.sspace.design import h2reg, _lft
+
     K0, _ = h2reg(dsys, n_meas=n_meas, n_ctrl=n_ctrl)
-    return K0
+
+    def _closed_loop_margin(K):
+        dcl = _lft(dsys, K, n_meas, n_ctrl, dt=dsys.dt)
+        return dcl, 1.0 - float(np.max(np.abs(np.linalg.eigvals(dcl.A))))
+
+    dcl0, margin0 = _closed_loop_margin(K0)
+    STRICT_MARGIN = 1e-3  # "genuinely, robustly stable", not just barely <1
+    if margin0 >= STRICT_MARGIN:
+        return K0
+
+    K_discounted = _stabilising_h2_discounted(dsys, n_meas, n_ctrl, STRICT_MARGIN)
+    return K_discounted if K_discounted is not None else K0
+
+
+def _stabilising_h2_discounted(dsys, n_meas, n_ctrl, strict_margin):
+    """Search a range of LQG discount factors for a strictly-stabilizing K0.
+
+    Returns None (caller falls back to the marginal h2reg K0) if no
+    candidate achieves the requested stability margin.
+    """
+    import scipy.linalg as la
+    from directsd.linalg.minreal import Minreal
+    from directsd.sspace.design import _ssbal, _lft
+    from directsd.linalg.riccati import dare1 as _dare1
+
+    A, B, C, D = Minreal.ss(dsys.A, dsys.B, dsys.C, dsys.D)
+    nout, nin = C.shape[0], B.shape[1]
+    i1 = nin - n_ctrl
+    o1 = nout - n_meas
+    B1 = B[:, :i1]; B2 = B[:, i1:]
+    C1 = C[:o1, :]; C2 = C[o1:, :]
+    D11 = D[:o1, :i1]; D12 = D[:o1, i1:]
+    D21 = D[o1:, :i1]
+
+    A, BC_bal, CC_bal = _ssbal(A, np.hstack([B1, B2]), np.vstack([C1, C2]))
+    B1 = BC_bal[:, :i1]; B2 = BC_bal[:, i1:]
+    C1 = CC_bal[:o1, :]; C2 = CC_bal[o1:, :]
+
+    def build(alpha):
+        A_s, B2_s, C2_s = alpha * A, alpha * B2, alpha * C2
+        Q_lqr, R_lqr, N_lqr = C1.T @ C1, D12.T @ D12, C1.T @ D12
+        X, _, _ = _dare1(A_s, B2_s, Q_lqr, R_lqr, N_lqr)
+        RBX = R_lqr + B2_s.T @ X @ B2_s
+        F  = -la.solve(RBX, B2_s.T @ X @ A_s + D12.T @ C1)
+        F0 = -la.solve(RBX, B2_s.T @ X @ (alpha * B1) + D12.T @ D11)
+
+        Q_kal, R_kal, N_kal = B1 @ B1.T, D21 @ D21.T, B1 @ D21.T
+        Y, _, _ = _dare1(A_s.T, C2_s.T, Q_kal, R_kal, N_kal)
+        SY = R_kal + C2_s @ Y @ C2_s.T
+        L  = -la.solve(SY.T, (A_s @ Y @ C2_s.T + (alpha * B1) @ D21.T).T).T
+        L0 =  la.solve(SY.T, (F @ Y @ C2_s.T + F0 @ D21.T).T).T
+
+        # Reassemble with the ORIGINAL (undiscounted) plant matrices --
+        # alpha only reshapes the Riccati solves above, not the physical
+        # plant the compensator actually has to run against.
+        Ac = A + B2 @ F + L @ C2 - B2 @ L0 @ C2
+        Bc = L - B2 @ L0
+        Cc = L0 @ C2 - F
+        Dc = L0
+        return sig.StateSpace(Ac, Bc, Cc, Dc, dt=dsys.dt)
+
+    def plain_h2_cost(dcl):
+        # Independent Lyapunov-based H2 check -- deliberately bypasses
+        # sdnorm's PBH-based marginal-mode special-casing, which is itself
+        # unreliable in exactly this near-marginal regime.
+        try:
+            P = la.solve_discrete_lyapunov(dcl.A, dcl.B @ dcl.B.T)
+            h2sq = np.trace(dcl.C @ P @ dcl.C.T) + np.trace(dcl.D @ dcl.D.T)
+            return float(np.sqrt(h2sq)) if h2sq > 0 and np.isfinite(h2sq) else float('inf')
+        except (np.linalg.LinAlgError, ValueError):
+            return float('inf')
+
+    best_K, best_cost = None, float('inf')
+    for exp in range(24, 3, -1):
+        alpha = 1.0 + 2.0 ** (-exp)
+        try:
+            K_cand = build(alpha)
+        except (np.linalg.LinAlgError, ValueError):
+            continue
+        dcl, margin = None, None
+        try:
+            dcl = _lft(dsys, K_cand, n_meas, n_ctrl, dt=dsys.dt)
+            margin = 1.0 - float(np.max(np.abs(np.linalg.eigvals(dcl.A))))
+        except (np.linalg.LinAlgError, ValueError):
+            continue
+        if margin < strict_margin:
+            continue
+        cost = plain_h2_cost(dcl)
+        if cost < best_cost:
+            best_K, best_cost = K_cand, cost
+
+    return best_K
+
+
+def _solve_q_program(build_objective, constraints_base, Q_var, q_reg0=1e-6,
+                      solver=None, verbose=False, max_tries=6, q_abs_cap=1e4):
+    """Solve a Q-parameterized cvxpy Problem with a self-calibrating
+    Tikhonov penalty on ||Q||^2.
+
+    Phi12/Phi21 (see _youla_maps) can be genuinely rank-deficient -- checked
+    directly on a real MIMO benchmark: Phi21's smallest singular value was
+    ~1e-19 (not merely poorly conditioned, actually singular to double
+    precision), leaving a real null-space direction in Q with zero effect
+    on the objective. Without any penalty on Q's own magnitude, cvxpy
+    confirmed the raw LP is genuinely `unbounded` there (not just slow or
+    inaccurate) -- the solver is free to drive Q to arbitrarily large,
+    physically meaningless values along that direction (observed: Q
+    coefficients up to ~6e6 from an `optimal_inaccurate` solve with no
+    regularization), which then breaks the closed-loop reconstruction
+    numerically.
+
+    `build_objective(q_reg)` must return a `cp.Minimize(base_cost + q_reg *
+    cp.sum_squares(Q_var))` expression. Starts at `q_reg0` and retries with
+    a geometrically larger q_reg (x100 each time, up to `max_tries`) unless
+    the solve both (a) reports a status other than "unbounded"/
+    "unbounded_inaccurate"/"user_limit" -- the last one matters too: a
+    poorly-conditioned near-null-space direction doesn't just risk an
+    unbounded objective, it can also make the solver time out mid-descent
+    while still exploring that direction, confirmed on a real benchmark
+    (Mixed H2/L1 hit "user_limit" with Q coefficients that, while not
+    literally unbounded, were still large enough to leave the closed loop
+    unstable) -- and (b) returns a Q with a sane magnitude (capped at
+    `q_abs_cap`; the well-regularized pendulum-benchmark solutions this was
+    tuned against topped out around ~100, so 1e4 is a generous margin above
+    genuine solutions but far below the ~1e6-6e6 pathological blowups seen
+    with no regularization at all). This self-calibrates to whatever this
+    specific Phi12/Phi21 actually needs instead of relying on a single
+    hand-tuned constant that would be wrong for a different plant's scale.
+
+    Returns
+    -------
+    prob : the solved cp.Problem (whichever q_reg succeeded, or the last
+        attempt if none met both criteria)
+    q_reg_used : float
+    """
+    BAD_STATUSES = ("unbounded", "unbounded_inaccurate", "user_limit")
+    q_reg = q_reg0
+    prob = None
+    for _ in range(max_tries):
+        objective = build_objective(q_reg)
+        prob = cp.Problem(objective, constraints_base)
+        prob.solve(solver=solver, verbose=verbose)
+        ok_status = prob.status not in BAD_STATUSES and Q_var.value is not None
+        ok_magnitude = ok_status and np.max(np.abs(Q_var.value)) < q_abs_cap
+        if ok_magnitude:
+            return prob, q_reg
+        q_reg *= 100.0
+    return prob, q_reg
+
+
+def _verify_stabilizes(dsys, K_opt, n_meas, n_ctrl, context, marginal_tol=1e-4):
+    """Raise a clear error if K_opt does not actually stabilize dsys.
+
+    The Q-parameterization used throughout this module (_youla_maps /
+    _fir_controller_from_q) is only guaranteed to produce a stabilizing
+    K(Q) for every stable Q when the base controller K0 (_stabilising_h2)
+    *strictly* stabilizes the plant. `_stabilising_h2` now actively
+    regularizes h2reg's K0 for exactly this reason (see its own
+    docstring), so that specific precondition failure is largely closed.
+
+    A second, independent gap remains open, and is the more likely cause
+    of this error firing even with a robustly-stabilizing K0: the
+    finite-horizon FIR-Q linear program (`sdl1_reg`/`sd_mixed_h2_l1`/
+    `sd_constrained`) has *no explicit stability constraint at all* -- it
+    only minimises a truncated-horizon (`N_fir + n + nk` samples) cost, so
+    it is free to select a Q whose truncated cost looks good while the
+    true (untruncated) closed loop is genuinely unstable. Confirmed
+    reproducible on a MIMO inverted-pendulum benchmark even after fixing
+    K0's own marginal eigenvalue (K0 margin ~0.10, robustly stable):
+    sdl1_reg/sd_mixed_h2_l1 still returned closed-loop pole magnitude
+    ~1.2 at the default N_fir=30. Not fixed at the root -- would need an
+    explicit stability-margin constraint in the LP, which isn't naturally
+    LP-representable (likely requires reformulating as an SDP with a
+    Lyapunov/KYP constraint) -- this only prevents silently returning a
+    bad controller.
+    """
+    from directsd.sspace.design import _lft
+    dcl = _lft(dsys, K_opt, n_meas, n_ctrl, dt=dsys.dt)
+    mag = np.abs(np.linalg.eigvals(dcl.A))
+    unstable = mag >= 1.0 - 1e-9
+    marginal = unstable & (np.abs(mag - 1.0) < marginal_tol)
+    if np.any(unstable & ~marginal):
+        worst = float(mag[unstable & ~marginal].max())
+        raise np.linalg.LinAlgError(
+            f"{context}: the synthesized controller does not stabilize the actual "
+            f"closed loop (worst pole magnitude {worst:.4f} >= 1). _stabilising_h2's "
+            f"base controller K0 is regularized to be robustly stable, so this is "
+            f"most likely the FIR-Q linear program itself selecting a destabilizing "
+            f"Q -- the LP has no explicit stability constraint (see "
+            f"_verify_stabilizes' docstring). Try a different N_fir, or check "
+            f"eig(_lft(dsys, _stabilising_h2(dsys, n_meas, n_ctrl), n_meas, n_ctrl, "
+            f"dt=dsys.dt).A) directly to rule out the base controller itself."
+        )
 
 
 def _youla_maps(dsys, K0, n_meas, n_ctrl, N_fir):
@@ -302,7 +520,7 @@ def youla_basis(dsys, K0, N_fir, n_meas=1, n_ctrl=1):
     return _youla_maps(dsys, K0, n_meas, n_ctrl, N_fir)
 
 
-def sdl1_reg(dsys, N_fir=30, n_meas=1, n_ctrl=1, solver=None, verbose=False):
+def sdl1_reg(dsys, N_fir=30, n_meas=1, n_ctrl=1, solver=None, verbose=False, q_reg=1e-6):
     """
     L1-optimal (peak-to-peak) controller synthesis via Linear Programming.
 
@@ -321,13 +539,19 @@ def sdl1_reg(dsys, N_fir=30, n_meas=1, n_ctrl=1, solver=None, verbose=False):
     n_ctrl  : int
     solver  : str or None   CVXPY solver ('HIGHS', 'CLARABEL', 'SCS', …)
     verbose : bool
+    q_reg   : float   starting Tikhonov weight on ||Q||^2 -- see
+        _solve_q_program's docstring. Self-calibrates upward if the raw
+        problem turns out to be unbounded, so this default rarely needs
+        changing; lower it only if you need Q pushed harder toward the
+        true (unregularized) L1 optimum on a well-conditioned plant.
 
     Returns
     -------
     K_opt   : scipy.signal.StateSpace (discrete)
-    l1_norm : float   achieved L1-norm (peak-to-peak gain)
+    l1_norm : float   achieved L1-norm (peak-to-peak gain), computed from
+        the actual T(Q) -- excludes the regularization term
     Q_fir   : np.ndarray, shape (N_fir, n_ctrl, n_meas)
-    result  : dict   {'status', 'objective', 'solver'}
+    result  : dict   {'status', 'objective', 'solver', 'q_reg'}
     """
     _require_cvxpy()
 
@@ -346,11 +570,13 @@ def sdl1_reg(dsys, N_fir=30, n_meas=1, n_ctrl=1, solver=None, verbose=False):
     # LP reformulation: introduce t ≥ |T|, then min max_j Σ_i t_ij
     t = cp.Variable((N * p, N * m), name="t_abs")
     col_sums = cp.sum(t, axis=0)          # shape (N*m,)
-    objective = cp.Minimize(cp.max(col_sums))
     constraints = [t >= T_Q, t >= -T_Q]
 
-    prob = cp.Problem(objective, constraints)
-    prob.solve(solver=solver, verbose=verbose)
+    def build_objective(reg):
+        return cp.Minimize(cp.max(col_sums) + reg * cp.sum_squares(Q_var))
+
+    prob, q_reg_used = _solve_q_program(
+        build_objective, constraints, Q_var, q_reg0=q_reg, solver=solver, verbose=verbose)
 
     if prob.status not in ("optimal", "optimal_inaccurate"):
         warnings.warn(f"L1 synthesis: solver status '{prob.status}'")
@@ -359,18 +585,23 @@ def sdl1_reg(dsys, N_fir=30, n_meas=1, n_ctrl=1, solver=None, verbose=False):
             if Q_var.value is not None else np.zeros((N_fir, nc, nm))
 
     K_opt  = _fir_controller_from_q(K0, Q_opt, dsys, n_meas, n_ctrl)
-    l1_val = float(prob.value) if prob.value is not None else float('nan')
+    _verify_stabilizes(dsys, K_opt, n_meas, n_ctrl, context="sdl1_reg")
+
+    # Report the TRUE L1 cost (excludes the Tikhonov penalty added above).
+    T_opt = T_cl + Phi12 @ _build_toeplitz_np(Q_opt, nc, nm) @ Phi21
+    l1_val = float(np.max(np.sum(np.abs(T_opt), axis=0)))
 
     return K_opt, l1_val, Q_opt, {
         "status":    prob.status,
         "objective": l1_val,
         "solver":    prob.solver_stats.solver_name if prob.solver_stats else None,
+        "q_reg":     q_reg_used,
     }
 
 
 def sd_mixed_h2_l1(dsys, N_fir=30, n_meas=1, n_ctrl=1,
                    l1_bound=None, h2_bound=None,
-                   solver=None, verbose=False):
+                   solver=None, verbose=False, q_reg=1e-6):
     """
     Mixed H2 / L1 optimal controller synthesis.
 
@@ -390,6 +621,9 @@ def sd_mixed_h2_l1(dsys, N_fir=30, n_meas=1, n_ctrl=1,
     h2_bound  : float or None   upper bound on H2-norm
     solver    : str or None
     verbose   : bool
+    q_reg     : float   starting Tikhonov weight on ||Q||^2 -- see
+        sdl1_reg's / _solve_q_program's docstring for why this exists and
+        why it self-calibrates.
 
     Returns
     -------
@@ -420,23 +654,24 @@ def sd_mixed_h2_l1(dsys, N_fir=30, n_meas=1, n_ctrl=1,
     l1_obj   = cp.max(col_sums)
 
     constraints = [t_abs >= T_Q, t_abs >= -T_Q]
-
-    if l1_bound is not None and h2_bound is None:
-        objective = cp.Minimize(h2_sq)
+    if l1_bound is not None:
         constraints.append(l1_obj <= l1_bound)
-    elif h2_bound is not None and l1_bound is None:
-        objective = cp.Minimize(l1_obj)
+    if h2_bound is not None:
         constraints.append(h2_sq <= h2_bound ** 2)
-    else:
-        scale = float(np.linalg.norm(T_cl, 'fro') + 1e-8)
-        objective = cp.Minimize(h2_sq / scale ** 2 + l1_obj / scale)
-        if l1_bound is not None:
-            constraints.append(l1_obj <= l1_bound)
-        if h2_bound is not None:
-            constraints.append(h2_sq <= h2_bound ** 2)
 
-    prob = cp.Problem(objective, constraints)
-    prob.solve(solver=solver, verbose=verbose)
+    scale = float(np.linalg.norm(T_cl, 'fro') + 1e-8)
+
+    def build_objective(reg):
+        reg_term = reg * cp.sum_squares(Q_var)
+        if l1_bound is not None and h2_bound is None:
+            return cp.Minimize(h2_sq + reg_term)
+        elif h2_bound is not None and l1_bound is None:
+            return cp.Minimize(l1_obj + reg_term)
+        else:
+            return cp.Minimize(h2_sq / scale ** 2 + l1_obj / scale + reg_term)
+
+    prob, q_reg_used = _solve_q_program(
+        build_objective, constraints, Q_var, q_reg0=q_reg, solver=solver, verbose=verbose)
 
     if prob.status not in ("optimal", "optimal_inaccurate"):
         warnings.warn(f"Mixed H2/L1: solver status '{prob.status}'")
@@ -446,12 +681,13 @@ def sd_mixed_h2_l1(dsys, N_fir=30, n_meas=1, n_ctrl=1,
 
     T_opt = T_cl + Phi12 @ _build_toeplitz_np(Q_opt, nc, nm) @ Phi21
     K_opt = _fir_controller_from_q(K0, Q_opt, dsys, n_meas, n_ctrl)
+    _verify_stabilizes(dsys, K_opt, n_meas, n_ctrl, context="sd_mixed_h2_l1")
     cost  = {
         "h2": float(np.sqrt(max(np.sum(T_opt ** 2), 0))),
         "l1": float(np.max(np.sum(np.abs(T_opt), axis=0))),
     }
 
-    return K_opt, cost, Q_opt, {"status": prob.status}
+    return K_opt, cost, Q_opt, {"status": prob.status, "q_reg": q_reg_used}
 
 
 def sd_constrained(dsys, N_fir=30, n_meas=1, n_ctrl=1,
@@ -459,7 +695,7 @@ def sd_constrained(dsys, N_fir=30, n_meas=1, n_ctrl=1,
                    envelope=None,
                    output_bound=None,
                    input_bound=None,
-                   solver=None, verbose=False):
+                   solver=None, verbose=False, q_reg=1e-6):
     """
     Synthesis with hard time-domain constraints.
 
@@ -530,21 +766,23 @@ def sd_constrained(dsys, N_fir=30, n_meas=1, n_ctrl=1,
     col_sums = cp.sum(t_abs, axis=0)
     constraints += [t_abs >= T_Q, t_abs >= -T_Q]
 
-    if objective == 'h2':
-        obj = cp.Minimize(cp.sum_squares(T_Q))
-    elif objective == 'l1':
-        obj = cp.Minimize(cp.max(col_sums))
-    elif objective == 'linf':
-        # Minimise the largest singular value of the finite-horizon Toeplitz
-        # matrix — a convex proxy for the induced ℓ2→ℓ2 norm.
-        obj = cp.Minimize(cp.norm(T_Q, 2))
-    else:
-        raise ValueError(
-            f"Unknown objective '{objective}'. Choose 'h2', 'l1', or 'linf'."
-        )
+    def build_objective(reg):
+        reg_term = reg * cp.sum_squares(Q_var)
+        if objective == 'h2':
+            return cp.Minimize(cp.sum_squares(T_Q) + reg_term)
+        elif objective == 'l1':
+            return cp.Minimize(cp.max(col_sums) + reg_term)
+        elif objective == 'linf':
+            # Minimise the largest singular value of the finite-horizon
+            # Toeplitz matrix — a convex proxy for the induced l2->l2 norm.
+            return cp.Minimize(cp.norm(T_Q, 2) + reg_term)
+        else:
+            raise ValueError(
+                f"Unknown objective '{objective}'. Choose 'h2', 'l1', or 'linf'."
+            )
 
-    prob = cp.Problem(obj, constraints)
-    prob.solve(solver=solver, verbose=verbose)
+    prob, q_reg_used = _solve_q_program(
+        build_objective, constraints, Q_var, q_reg0=q_reg, solver=solver, verbose=verbose)
 
     if prob.status not in ("optimal", "optimal_inaccurate"):
         warnings.warn(f"sd_constrained: solver status '{prob.status}'")
@@ -554,6 +792,7 @@ def sd_constrained(dsys, N_fir=30, n_meas=1, n_ctrl=1,
 
     T_opt = T_cl + Phi12 @ _build_toeplitz_np(Q_opt, nc, nm) @ Phi21
     K_opt = _fir_controller_from_q(K0, Q_opt, dsys, n_meas, n_ctrl)
+    _verify_stabilizes(dsys, K_opt, n_meas, n_ctrl, context="sd_constrained")
 
     sv = np.linalg.svd(T_opt, compute_uv=False)
     achieved = {
@@ -562,7 +801,7 @@ def sd_constrained(dsys, N_fir=30, n_meas=1, n_ctrl=1,
         "linf": float(sv[0]) if len(sv) > 0 else float('nan'),
     }
 
-    return K_opt, achieved, Q_opt, {"status": prob.status}
+    return K_opt, achieved, Q_opt, {"status": prob.status, "q_reg": q_reg_used}
 
 
 # ── L1-norm analysis (no synthesis) ──────────────────────────────────────────

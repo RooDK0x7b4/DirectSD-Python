@@ -76,8 +76,13 @@ directsd/
 │
 ├── sspace/                      # State-space design
 │   ├── plant.py                 # GeneralizedPlant class (augmented plant representation)
-│   └── design.py                # h2reg, hinfreg, sdh2reg, sdhinfreg,
-│                                #   sdfast, separss
+│   ├── design.py                # h2reg, hinfreg, sdh2reg, sdhinfreg,
+│   │                            #   sdfast, separss
+│   └── hinfsd.py                # Native discrete Hinf synthesis: sdhimod (all 5
+│                                #   discretization formulas) + hinfone/hinfone1
+│                                #   (both gamma=1 synthesis methods) -- sdhinfreg's
+│                                #   primary path, exact rather than the bilinear
+│                                #   DT->CT->DT approximation
 │
 ├── tf/                          # Block-diagram arithmetic
 │   ├── interconnect.py          # mul, neg, add, feedback, nd, to_lti
@@ -100,7 +105,7 @@ directsd/
 │                                #   (11 core-utility examples), _common.py (shared helpers)
 │
 └── tests/
-    └── test_directsd.py         # 228 pytest tests (209 core + 19 convex,
+    └── test_directsd.py         # 254 pytest tests (235 core + 19 convex,
                                  #   convex skipped automatically without cvxpy)
 ```
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "DirectSD-Python"
-version = "0.1.0"
+version = "0.2.0"
 description = "Direct Sampled-Data Control Systems Toolbox — Python port of MATLAB DirectSD v3.0"
 readme = "README.md"
 requires-python = ">=3.8"
